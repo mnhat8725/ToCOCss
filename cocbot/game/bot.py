@@ -1,14 +1,17 @@
 import logging
+import math
 import os
 import queue
 import threading
 import time
+from collections import Counter
 
 import cv2
 
-from config import AppConfig
-from notify import Notifier
-from utils import user_path
+from cocbot.core.config import AppConfig
+from cocbot.core.notify import Notifier
+from cocbot.core.paths import user_path
+from cocbot.vision.state_detection import ScreenState, StateGuard, StateTimeout
 
 logger = logging.getLogger(__name__)
 
@@ -64,14 +67,10 @@ DEFAULT_RECOVERY = {
     "scan_restart_limit": 3,
 }
 
-# Multi-wave attack knobs (settings.json -> "attack"). The bot keeps re-deploying
-# goblin waves until at least `drain_ratio` of the resource providers counted at
-# scan time are gone, or `time_limit` seconds (measured from the first sweep)
-# have elapsed, whichever comes first. There is no wave cap on purpose: the
-# clock is the only guaranteed stop (the bot cannot read remaining troops).
+# Bounded waves. Detection loss is not evidence of damage or collected loot.
 DEFAULT_ATTACK = {
-    "drain_ratio": 0.8,
     "time_limit": 30.0,
+    "max_waves": 3,
 }
 
 # Sweep geometry (preserved from the notebook): tap every `_SWEEP_STEP` px from
@@ -125,6 +124,8 @@ class CocBot:
         notifier: Notifier | None = None,
         recovery: dict | None = None,
         attack: dict | None = None,
+        screen_detector=None,
+        recorder=None,
     ):
         self.config = config
         self.window = window_manager
@@ -141,8 +142,41 @@ class CocBot:
 
         self._stop_event = threading.Event()
         self._thread = None
+        self.recorder = recorder
+        self.guard = StateGuard(self.window.capture_window, screen_detector, self._stop_event, recorder) if screen_detector else None
+        self.required_resources = {config.GOLD, config.ELIXIR}
+
+    def _ensure_state(self, expected, action):
+        if self.guard:
+            observation = self.guard.wait_for(expected, timeout=self.config.state_timeout, action=action)
+            self._log(f"screen: {observation.state.value} ({action})")
+            return observation.state
+        return None
+
+    def _navigate_to_preview(self):
+        if not self.guard:
+            for button in (self.config.ATTACK_BTN_HOME, self.config.FIND_BTN, self.config.ATTACK_BTN):
+                self._press_button(button)
+            return
+        state = self._ensure_state([ScreenState.HOME, ScreenState.MATCH_MENU, ScreenState.PREVIEW], "start search")
+        if state == ScreenState.HOME:
+            self._press_button(self.config.ATTACK_BTN_HOME)
+            state = self._ensure_state([ScreenState.MATCH_MENU, ScreenState.PREVIEW], "open attack menu")
+        if state == ScreenState.MATCH_MENU:
+            self._press_button(self.config.FIND_BTN)
+            state = self._ensure_state([ScreenState.MATCH_MENU, ScreenState.PREVIEW], "find match")
+            if state == ScreenState.MATCH_MENU:
+                self._press_button(self.config.ATTACK_BTN)
+                self._ensure_state([ScreenState.PREVIEW], "confirm match")
 
     # ---- Public lifecycle ----
+
+    @staticmethod
+    def goals_reached(totals, goals):
+        active = [(totals[key], goal) for key, goal in zip(
+            ("gold", "elixir", "delixir"), goals
+        ) if goal > 0]
+        return bool(active) and all(total >= goal for total, goal in active)
 
     def start(self, targets, goals):
         """
@@ -154,7 +188,14 @@ class CocBot:
         """
         if self._thread and self._thread.is_alive():
             self._log("Bot is already running")
-            return
+            return False
+
+        if any(len(values) != 3 or any(
+            not isinstance(v, int) or isinstance(v, bool) or v < 0 for v in values
+        ) for values in (targets, goals)):
+            self._alert("Thresholds and goals must be three non-negative integers.")
+            self._set_status("error")
+            return False
 
         missing = [
             name
@@ -171,31 +212,48 @@ class CocBot:
                 self.config.RETRY_BTN_2,
                 self.config.RETRY_BTN_3,
             )
-            if name not in self.controls
+            if not self._valid_control(self.controls.get(name))
         ]
         if missing:
             msg = (
                 "Cannot start: button positions missing for "
                 + ", ".join(missing)
-                + ". Run calibrate.py first."
+                + ". Run tools/calibrate.py first."
             )
             self._log(msg)
             self._alert(msg)
             self._notify("COC Auto-Farm: cannot start", msg)
-            return
+            self._set_status("error")
+            return False
 
         self._stop_event.clear()
+        if self.recorder:
+            self.recorder.record("farm_start", targets=list(targets), goals=list(goals),
+                                 layout_backend=self.config.layout_backend)
         self._thread = threading.Thread(
             target=self._farm_loop,
             args=(targets, goals),
             daemon=True,
         )
-        self._thread.start()
         self._set_status("running")
         self._log("Bot started")
+        self._thread.start()
+        return True
+
+    @staticmethod
+    def _valid_control(control):
+        return isinstance(control, dict) and all(
+            isinstance(control.get(axis), (int, float))
+            and not isinstance(control[axis], bool)
+            and math.isfinite(control[axis])
+            and 0 <= control[axis] <= 1
+            for axis in ("x", "y")
+        )
 
     def stop(self):
         """Request graceful stop."""
+        if not self.is_running():
+            return
         self._log("Stop requested")
         self._stop_event.set()
         self._set_status("stopping")
@@ -226,7 +284,7 @@ class CocBot:
     def _drain_summary(drains: list) -> str:
         """End-of-session line: every raid's %drained plus the average."""
         if not drains:
-            return "drain per raid: none completed"
+            return "Detection loss is not used as a loot or destruction measurement."
         per = ", ".join(f"{d * 100:.0f}%" for d in drains)
         avg = sum(drains) / len(drains)
         return (
@@ -316,6 +374,8 @@ class CocBot:
                 f"waited {time.time() - (deadline - seconds):.2f}s "
                 f"(target {seconds:.2f}s) for {why}"
             )
+        if self._stop_event.is_set():
+            raise RuntimeError("Bot stopped")
 
     # ---- Fixed button helpers (normalized coords, no YOLO) ----
 
@@ -331,8 +391,8 @@ class CocBot:
         if not self.window.win_width or not self.window.win_height:
             self.window.get_rect()
         return (
-            int(norm["x"] * self.window.win_width),
-            int(norm["y"] * self.window.win_height),
+            min(self.window.win_width - 1, int(norm["x"] * self.window.win_width)),
+            min(self.window.win_height - 1, int(norm["y"] * self.window.win_height)),
         )
 
     def _press_button(self, name: str, wait_after: float | None = None):
@@ -342,6 +402,8 @@ class CocBot:
         loop refuses to start, so missing entries here are a programming error
         / stale settings. An explicit wait_after overrides the settings value.
         """
+        if self._stop_event.is_set():
+            raise RuntimeError("Bot stopped")
         try:
             x, y = self._button_coords(name)
         except KeyError:
@@ -353,6 +415,8 @@ class CocBot:
             f" [{norm.get('x', 0):.3f}, {norm.get('y', 0):.3f}] wait {wait:g}s"
         )
         self.auto.click(x, y)
+        if self.recorder:
+            self.recorder.record("tap", button=name, pixel=[x, y], wait_seconds=wait)
         self._sleep(wait)
 
     # ---- Vision helpers (YOLO/OCR for content that moves per base) ----
@@ -365,6 +429,7 @@ class CocBot:
         """
         max_retries = self.config.max_retries
         targets = [self.config.GOLD, self.config.ELIXIR, self.config.D_ELIXIR]
+        previous = None
 
         for attempt in range(1, max_retries + 1):
             if self._stop_event.is_set():
@@ -384,11 +449,15 @@ class CocBot:
             for cls in targets:
                 if cls in details:
                     bbox = details[cls][0]["bbox"]
-                    result[cls] = self.vision.read_number(frame, bbox)
+                    reading = self.vision.read_number_result(frame, bbox)
+                    if reading.value is not None:
+                        result[cls] = str(reading.value)
 
-            if result:
+            required = {k: result[k] for k in self.required_resources if k in result}
+            if self.required_resources.issubset(result) and required == previous:
                 logger.debug(f"base treasures read: {result}")
                 return result
+            previous = required if self.required_resources.issubset(result) else None
 
         raise TreasureScanFailed(
             f"Could not find treasures {targets} after {max_retries} attempts"
@@ -418,12 +487,11 @@ class CocBot:
                 self._sleep(self.waits["scan_base_retry"], why="base layout scan retry")
 
             frame = self.window.capture_window()
-            details = self.vision.detect_with_details(frame, targets)
-            if details:
-                return {
-                    cls: [item["center"] for item in items]
-                    for cls, items in details.items()
-                }
+            layout = self.vision.detect_layout(frame)
+            if layout:
+                if self.recorder and self.vision.last_layout_result is not None:
+                    self.recorder.record("layout", **self.vision.last_layout_result.metadata())
+                return layout
 
         raise ScanFailed(
             f"Could not find base layout {targets} after {max_retries} attempts"
@@ -434,20 +502,9 @@ class CocBot:
         Read the post-battle loot (YOLO boxes -> OCR values), driven by data
         rather than a fixed pause.
 
-        The first frames after confirming the surrender are usually still
-        rendering (blank loot, or only some labels drawn), and a single early
-        read therefore reports 0 even for a successful attack. Since the summary
-        is static while the bot holds on it, poll for the whole timeout and keep
-        the maximum value read per resource: OCR misses read 0, so the max over
-        the window recovers the real number once the screen settles. Returns
-        early once all three resources are non-zero; at timeout returns the best
-        (possibly partial) values so the raid still counts what it could read.
-
-        The boxes are detected at a slightly lower confidence than the global
-        default (a missed Dark Elixir box is common) and the summary's Return
-        Home button is used as a settle signal: once it is drawn and any resource
-        has a real value, the read stops, so a genuinely empty resource does not
-        force a full-timeout wait.
+        Require two agreeing readings per resource, including a real zero.
+        Unreadable values do not vote. A single high outlier cannot inflate totals;
+        at timeout only values confirmed in multiple frames are returned.
         """
         targets = [
             self.config.POST_GOLD,
@@ -463,6 +520,7 @@ class CocBot:
         post_conf = max(0.3, min(self.config.conf, 0.35))
         summary_marker = self.config.RETURN_HOME
         best = {}
+        votes = {cls: Counter() for cls in targets}
         polls = 0
 
         while True:
@@ -484,35 +542,26 @@ class CocBot:
                     if any(_iou(bbox, seen) > _BOX_OVERLAP_IOU for seen in kept):
                         continue
                     kept.append(bbox)
-                    value = int(self.vision.read_number(frame, bbox))
-                    if value > best.get(cls, 0):
-                        best[cls] = value
+                    reading = self.vision.read_number_result(frame, bbox)
+                    if reading.value is not None:
+                        votes[cls][reading.value] += 1
+                        if votes[cls][reading.value] >= 2:
+                            best[cls] = reading.value
+                    break  # at most one vote per resource per frame
 
             logger.debug(f"post-game poll {polls}: {best}")
             self._dump_post_frame(frame, polls)
 
-            if all(best.get(cls, 0) > 0 for cls in targets):
+            if all(cls in best for cls in targets):
                 result = {cls: str(v) for cls, v in best.items()}
                 logger.debug(f"post-game loot read: {result} (after {polls} poll(s))")
-                return result
-
-            # The summary is on screen once its Return Home button is drawn; if we
-            # already have a real number, stop now. A resource still at 0 is
-            # genuinely empty rather than unreadable, so polling the rest of the
-            # window would only waste time.
-            if details.get(summary_marker) and any(v > 0 for v in best.values()):
-                result = {cls: str(v) for cls, v in best.items()}
-                logger.debug(
-                    f"post-game loot read: {result} "
-                    f"(summary up after {polls} poll(s))"
-                )
                 return result
 
             if time.time() >= deadline:
                 if not any(v > 0 for v in best.values()):
                     self._log(
                         f"post-battle loot not readable after "
-                        f"{self.waits['scan_post_timeout']:g}s; counted as 0"
+                        f"{self.waits['scan_post_timeout']:g}s; no confirmed loot"
                     )
                     return {}
                 result = {cls: str(v) for cls, v in best.items()}
@@ -578,13 +627,15 @@ class CocBot:
         not swept twice.
         """
         _, limit = self._button_coords(self.config.SURR_BTN)
+        margin = _ATTACK_ROW_MARGIN * self.window.win_height / 900
+        tolerance = _ATTACK_ROW_TOLERANCE * self.window.win_height / 900
         rows = []
         for cls in (self.config.GOLDS, self.config.ELIXIRS, self.config.D_ELIXIRS):
             for item in base.get(cls, []):
                 y = item[1]
-                if y >= limit - _ATTACK_ROW_MARGIN:
+                if y >= limit - margin:
                     continue
-                if any(abs(y - seen) <= _ATTACK_ROW_TOLERANCE for seen in rows):
+                if any(abs(y - seen) <= tolerance for seen in rows):
                     continue
                 rows.append(y)
         return rows
@@ -603,6 +654,8 @@ class CocBot:
                 self.window.win_width - _SWEEP_RIGHT_MARGIN,
                 _SWEEP_STEP,
             ):
+                if self._stop_event.is_set():
+                    raise RuntimeError("Bot stopped")
                 logger.debug(f"tap sweep at ({a}, {k})")
                 try:
                     self.auto.click(a, k)
@@ -619,126 +672,70 @@ class CocBot:
         return total_taps
 
     def _initiate_attack(self, base: dict):
-        """
-        Deploy goblin waves until the resource providers are drained. ``base``
-        comes from ``_scan_base_layout``: ``{class_name: [(cx, cy), ...], ...}``;
-        goblin and surr are calibrated controls, not part of the scan.
+        """Execute bounded goblin waves; detection loss never estimates loot."""
+        from cocbot.game.execution import execute_plan
 
-        The count of providers (gold/elixir/dark stores) seen at scan time is the
-        baseline. Each wave deploys goblins across every provider row, then the
-        base is re-scanned and the remaining provider count compared: if at least
-        ``attack.drain_ratio`` (default 80%) are gone the loop stops, otherwise
-        another wave is deployed — until ``attack.time_limit`` seconds (default
-        90, measured from the first sweep) have passed, a Stop is requested, or a
-        re-scan fails. There is no wave cap: the clock is the only guaranteed
-        stop because the bot cannot read remaining troops.
-
-        A Stop request (F12) is honored before the first deploy and between
-        waves, but never mid-sweep, so a started sweep always completes and troops
-        are not left half-deployed. The final pause before the caller surrenders
-        is ``waits.attack_settle``.
-        """
         if self._stop_event.is_set():
-            self._log("attack skipped: stop requested before deploy")
-            return
-
-        drain_ratio = float(self.attack.get("drain_ratio", 0.8))
-        time_limit = float(self.attack.get("time_limit", 90.0))
-        wave_settle = self.waits.get("attack_wave_settle", 5.0)
-
-        counts = self._provider_counts(base)
-        total = sum(counts.values())
-        self._log(
-            f"providers at scan: {total} "
-            f"(gold {counts[self.config.GOLDS]} / "
-            f"elixir {counts[self.config.ELIXIRS]} / "
-            f"dark {counts[self.config.D_ELIXIRS]})"
-        )
-
+            raise RuntimeError("Bot stopped")
+        time_limit = float(self.attack.get("time_limit", 30.0))
+        max_waves = int(self.attack.get("max_waves", 3))
+        if not math.isfinite(time_limit) or not 0 < time_limit <= 300 or not 1 <= max_waves <= 20:
+            raise ValueError("Attack requires 0 < time_limit <= 300 and 1 <= max_waves <= 20")
+        deadline = time.monotonic() + time_limit
         current = base
-        started = None
-        wave = 0
-        remaining = total
-        while True:
-            wave += 1
-            rows = self._attack_rows(current)
-            goblin = self._button_coords(self.config.S_GOBLIN)
-            self._log(f"wave {wave}: sweeping {len(rows)} row(s)")
-            self._log(f"tap s_goblin (deploy) at ({goblin[0]}, {goblin[1]})")
-            self.auto.click(goblin)
-            if started is None:
-                started = time.time()
-            self._sweep_rows(rows)
-
-            self._sleep(wave_settle, why="attack wave settle")
-
+        for wave in range(1, max_waves + 1):
             if self._stop_event.is_set():
-                self._log("stop requested between waves; surrendering")
+                raise RuntimeError("Bot stopped")
+            rows = self._attack_rows(current)
+            if not rows:
+                raise RuntimeError("No usable deployment rows; no troops deployed in this wave")
+            width, height = self.window.win_width, self.window.win_height
+            step = max(1, round(50 * width / 1600))
+            actions = [{"type": "select", "control": self.config.S_GOBLIN}]
+            for row in rows:
+                for x in range(step, width - max(1, round(100 * width / 1600)), step):
+                    actions.append({"type": "drop_troop", "point": [x / width, row / height],
+                                    "count": 1, "interval": 0.0})
+            plan = {"schema_version": 1, "coordinate_space": "normalized_device",
+                    "dry_run_only": False, "strategy": "existing_goblin_row_sweep",
+                    "actions": actions}
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 break
-
-            elapsed = time.time() - started
-            if elapsed >= time_limit:
-                self._log(
-                    f"attack time limit reached ({elapsed:.0f}s >= "
-                    f"{time_limit:g}s, wave {wave}); surrendering"
-                )
+            self._log(f"wave {wave}/{max_waves}: {len(rows)} rows, {len(actions)-1} deployment taps")
+            try:
+                execute_plan(plan, (width, height), self._stop_event, controller=self.auto,
+                             controls=self.controls, dry_run=False, recorder=self.recorder, timeout=remaining)
+            except TimeoutError:
+                self._log("Attack time limit reached during wave")
                 break
-
-            if total == 0:
-                self._log("no providers detected; not re-scanning")
+            self._sleep(min(self.waits.get("attack_wave_settle", 5.0), max(0, deadline-time.monotonic())))
+            if wave == max_waves or time.monotonic() >= deadline:
                 break
-
+            state = self._ensure_state([ScreenState.BATTLE, ScreenState.PREVIEW, ScreenState.RESULTS], "between waves")
+            if state == ScreenState.RESULTS:
+                break
             try:
                 current = self._scan_base_layout()
-            except ScanFailed as e:
-                self._log(f"post-wave rescan failed ({e}); surrendering")
+            except ScanFailed:
+                self._log("No reliable targets after wave; ending deployment without inferring destruction")
                 break
-
-            counts = self._provider_counts(current)
-            remaining = sum(counts.values())
-            drained = 1.0 - (remaining / total)
-            self._log(
-                f"wave {wave}: providers {remaining}/{total} remaining "
-                f"({drained * 100:.0f}% drained)"
-            )
-            if drained >= drain_ratio:
-                self._log(
-                    f"drain target reached ({drained * 100:.0f}% >= "
-                    f"{drain_ratio * 100:.0f}%) after {wave} wave(s)"
-                )
-                break
-
-        # Final pre-surrender reading: how many providers are left right now.
-        # A manual stop lands here (the wave loop breaks normally); a hard error
-        # raises earlier and skips this, so an erroring raid is not recorded.
-        drained = None
-        if total > 0:
-            now = self._count_providers_now()
-            fresh = now is not None
-            if fresh:
-                remaining = now
-            remaining = max(0, min(remaining, total))
-            drained = 1.0 - (remaining / total)
-            self._log(
-                f"drain at surrender: providers {remaining}/{total} remaining "
-                f"({drained * 100:.0f}% drained"
-                + ("" if fresh else ", last known")
-                + ")"
-            )
-
-        settle = self.waits.get("attack_settle", 5.0)
-        self._sleep(settle, why="attack settle before surrender")
-        return drained
+        self._sleep(min(self.waits.get("attack_settle", 5.0), max(0, deadline-time.monotonic())))
+        return None
 
     # ---- Farm loop (preserved notebook behaviour) ----
 
     def _farm_loop(self, targets, goals):
         gtarget, etarget, detarget = targets
-        g_goal, e_goal, de_goal = goals
+        self.required_resources = {cls for cls, threshold in zip(
+            (self.config.GOLD, self.config.ELIXIR, self.config.D_ELIXIR), targets) if threshold > 0}
+        if not self.required_resources:
+            self.required_resources = {self.config.GOLD, self.config.ELIXIR}
 
         st_time = time.time()
         totals = {"gold": 0, "elixir": 0, "delixir": 0}
         raid_drains = []
+        final_status = "stopped"
 
         # Warm up the models up front so there is no stall mid-raid.
         self._set_status("loading")
@@ -754,11 +751,7 @@ class CocBot:
 
             while not self._stop_event.is_set():
                 # Check total goals
-                if (
-                    totals["gold"] > g_goal
-                    and totals["elixir"] > e_goal
-                    and totals["delixir"] > de_goal
-                ):
+                if self.goals_reached(totals, goals):
                     e_time = time.time()
                     mins = (e_time - st_time) // 60
                     msg = f"Completed in {mins} min"
@@ -773,15 +766,7 @@ class CocBot:
                     )
                     break
 
-                # Phase 1: navigate to attack (calibrated fixed buttons)
-                for btn in [
-                    self.config.ATTACK_BTN_HOME,
-                    self.config.FIND_BTN,
-                    self.config.ATTACK_BTN,
-                ]:
-                    if self._stop_event.is_set():
-                        break
-                    self._press_button(btn)
+                self._navigate_to_preview()
 
                 if self._stop_event.is_set():
                     break
@@ -791,10 +776,21 @@ class CocBot:
                 search = True
                 while search and not self._stop_event.is_set():
                     try:
+                        self._ensure_state([ScreenState.PREVIEW], "scan opponent")
                         base = self._scan_base_layout()
                         base_treasure = self._scan_treasures()
                     except ScanFailed as e:
                         scan_streak += 1
+                        if self.recorder:
+                            self.recorder.record("scan_failed", frame=self.window.capture_window(),
+                                                 error=str(e), streak=scan_streak)
+                        if self.guard:
+                            if scan_streak >= scan_limit:
+                                raise RuntimeError(f"Scan failed {scan_streak} times: {e}") from e
+                            self._ensure_state([ScreenState.PREVIEW], "recover scan failure")
+                            self._press_button(self.config.NXT_BTN)
+                            self._ensure_state([ScreenState.PREVIEW], "next opponent after scan failure")
+                            continue
                         # Notify on every failure, attaching a screenshot of the
                         # failing screen (captured here, before the recovery taps
                         # below, so the image is not the post-recovery screen).
@@ -855,10 +851,15 @@ class CocBot:
                         and current_elixir >= etarget
                     ):
                         # Attack
+                        self._ensure_state([ScreenState.PREVIEW], "before deploy")
                         drained = self._initiate_attack(base)
 
-                        self._press_button(self.config.SURR_BTN)
-                        self._press_button(self.config.SURR_CONF)
+                        state = self._ensure_state([ScreenState.BATTLE, ScreenState.PREVIEW, ScreenState.RESULTS], "finish attack")
+                        if state != ScreenState.RESULTS:
+                            self._press_button(self.config.SURR_BTN)
+                            self._press_button(self.config.SURR_CONF)
+
+                        self._ensure_state([ScreenState.RESULTS], "read battle result")
 
                         post_game = self._scan_post_game()
                         g_gain = int(post_game.get(self.config.POST_GOLD, 0))
@@ -891,6 +892,7 @@ class CocBot:
                             zero_loot_streak = 0
 
                         self._press_button(self.config.RETURN_HOME)
+                        self._ensure_state([ScreenState.HOME], "return home")
 
                         if zero_loot_streak >= scan_limit:
                             mins = (time.time() - st_time) // 60
@@ -912,7 +914,7 @@ class CocBot:
                         self._press_button(self.config.NXT_BTN)
 
                 if gave_up:
-                    self._set_status("error")
+                    final_status = "error"
                     break
 
         except RuntimeError as e:
@@ -926,8 +928,9 @@ class CocBot:
                     "COC Auto-Farm: error",
                     f"{e} (after {mins} min)" + self._drain_average(raid_drains),
                 )
-            self._set_status("error")
+                final_status = "error"
         except Exception as e:
+            logger.exception("Farm loop failed")
             self._log(f"error: {e}")
             mins = (time.time() - st_time) // 60
             self._alert(f"error: {e}, in {mins} min")
@@ -935,8 +938,10 @@ class CocBot:
                 "COC Auto-Farm: error",
                 f"{e} (after {mins} min)" + self._drain_average(raid_drains),
             )
-            self._set_status("error")
+            final_status = "error"
         finally:
-            self._set_status("stopped")
+            if self.recorder:
+                self.recorder.record("farm_end", status=final_status, totals=totals)
+            self._set_status(final_status)
             self._show_totals(totals)
             self._log(self._drain_summary(raid_drains))

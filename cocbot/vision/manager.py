@@ -1,9 +1,13 @@
 import logging
 import os
+from dataclasses import dataclass
+import re
 
 import cv2
+import numpy as np
 
-from utils import bundle_dir, configure_runtime_env
+from cocbot.core.paths import bundle_dir, configure_runtime_env, user_path
+from cocbot.vision.ocr_models import prepare_models
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +17,13 @@ logger = logging.getLogger(__name__)
 _OCR_ALLOWLIST = "0123456789.,KMBkmb"
 
 _SUFFIX_MULTIPLIERS = {"k": 1_000, "m": 1_000_000, "b": 1_000_000_000}
+
+
+@dataclass(frozen=True)
+class NumberReading:
+    value: int | None
+    raw: str
+    confidence: float
 
 
 def configure_easyocr_paths():
@@ -94,6 +105,32 @@ class VisionManager:
         self.config = config
         self.model = None
         self.reader = None
+        self.layout_engine = None
+        self.last_layout_result = None
+
+    def detect_layout(self, frame):
+        """Keep resource-full semantics while adapting coordinates for the farm."""
+        if self.config.layout_backend == "legacy":
+            return self.detect(frame, [self.config.GOLDS, self.config.ELIXIRS, self.config.D_ELIXIRS])
+        if self.config.layout_backend != "smart_farm":
+            raise ValueError(f"Unsupported layout backend: {self.config.layout_backend}")
+        if self.layout_engine is None:
+            from cocbot.vision.onnx_engine import Engine
+            self.layout_engine = Engine()
+        self.last_layout_result = self.layout_engine.infer(
+            frame, "ADB screenshot", "smart_farm", self.config.smart_farm_confidence, self.config.smart_farm_iou)
+        groups = {"gold_mine_full": self.config.GOLDS, "gold_storage_full": self.config.GOLDS,
+                  "elixir_collector_full": self.config.ELIXIRS, "elixir_storage_full": self.config.ELIXIRS,
+                  "de_drill_full": self.config.D_ELIXIRS, "de_storage_full": self.config.D_ELIXIRS}
+        layout = {}
+        for detection in self.last_layout_result.detections:
+            if detection.get("candidate_only"):
+                continue
+            if detection["class_name"] not in groups:
+                raise ValueError("Smart Farm metadata contains an unsupported class")
+            x1, y1, x2, y2 = detection["box_xyxy"]
+            layout.setdefault(groups[detection["class_name"]], []).append(((x1 + x2) / 2, (y1 + y2) / 2))
+        return layout
     
     def load(self):
         """
@@ -105,6 +142,8 @@ class VisionManager:
                 configure_runtime_env()
                 from ultralytics import YOLO
 
+                if not os.path.isfile(self.config.model_path):
+                    raise FileNotFoundError(self.config.model_path)
                 self.model = YOLO(self.config.model_path)
             except Exception as e:
                 raise RuntimeError(f"Failed to load YOLO model from '{self.config.model_path}': {e}")
@@ -117,9 +156,20 @@ class VisionManager:
                 import easyocr
 
                 use_gpu = torch.cuda.is_available() if self.config.gpu is None else self.config.gpu
-                self.reader = easyocr.Reader(['en'], gpu=use_gpu)
+                directory = prepare_models()
+                self.reader = easyocr.Reader(
+                    ['en'], gpu=use_gpu, model_storage_directory=str(directory),
+                    user_network_directory=user_path("easyocr_data/user_network"),
+                    download_enabled=False,
+                )
             except Exception as e:
                 raise RuntimeError(f"Failed to load EasyOCR reader: {e}")
+        if self.config.layout_backend == "smart_farm" and self.layout_engine is None:
+            from cocbot.vision.onnx_engine import Engine
+            engine = Engine()
+            engine.infer(np.zeros((64, 64, 3), np.uint8), "startup validation", "smart_farm",
+                         self.config.smart_farm_confidence, self.config.smart_farm_iou)
+            self.layout_engine = engine
     
     def detect(self, frame, class_names, conf=None):
         """
@@ -196,6 +246,10 @@ class VisionManager:
         return cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
 
     def read_number(self, frame, bbox):
+        reading = self.read_number_result(frame, bbox)
+        return str(reading.value) if reading.value is not None else "0"
+
+    def read_number_result(self, frame, bbox, min_confidence=.4):
         """
         OCR a region of the frame to extract a number.
 
@@ -210,18 +264,24 @@ class VisionManager:
         if self.reader is None:
             self.load()
 
-        x1, y1, x2, y2 = bbox
+        height, width = frame.shape[:2]
+        x1, y1, x2, y2 = (int(v) for v in bbox)
+        x1, x2 = max(0, x1), min(width, x2)
+        y1, y2 = max(0, y1), min(height, y2)
+        if x2 <= x1 or y2 <= y1:
+            return NumberReading(None, "", 0.)
         region = frame[y1:y2, x1:x2]
 
         if region.size == 0:
-            return "0"
+            return NumberReading(None, "", 0.)
 
         ocr_result = self.reader.readtext(
-            self._preprocess(region), detail=0, allowlist=_OCR_ALLOWLIST
+            self._preprocess(region), detail=1, allowlist=_OCR_ALLOWLIST
         )
 
         # EasyOCR can split a value into several fragments; keep them all.
-        raw = " ".join(str(part) for part in ocr_result) if ocr_result else ""
-        value = parse_loot_number(raw)
+        raw = " ".join(str(part[1]) for part in ocr_result) if ocr_result else ""
+        confidence = min((float(part[2]) for part in ocr_result), default=0.)
+        value = int(parse_loot_number(raw)) if re.search(r"[0-9]", raw) and confidence >= min_confidence else None
         logger.debug(f"OCR bbox={(x1, y1, x2, y2)} raw={raw!r} -> {value}")
-        return value
+        return NumberReading(value, raw, confidence)

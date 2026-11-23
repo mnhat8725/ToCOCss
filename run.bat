@@ -41,7 +41,7 @@ if errorlevel 1 goto :fail
 :have_venv
 
 rem --- Verify dependencies ---------------------------------------------------
-"%VENV_PY%" -c "import cv2, keyboard, PIL, numpy, ultralytics, easyocr" >nul 2>&1
+"%VENV_PY%" -c "import cv2, keyboard, PIL, numpy, ultralytics, easyocr, onnxruntime" >nul 2>&1
 if not errorlevel 1 goto :deps_ok
 
 echo.
@@ -52,7 +52,7 @@ if /i "%DO_REPAIR%"=="n" goto :deps_skipped
 echo Installing dependencies (this can take several minutes) ...
 "%VENV_PY%" -m pip install -r requirements.txt
 if errorlevel 1 goto :fail
-"%VENV_PY%" -c "import cv2, keyboard, PIL, numpy, ultralytics, easyocr" >nul 2>&1
+"%VENV_PY%" -c "import cv2, keyboard, PIL, numpy, ultralytics, easyocr, onnxruntime" >nul 2>&1
 if errorlevel 1 (
     echo ERROR: dependencies are still not importable.
     goto :fail
@@ -63,6 +63,10 @@ goto :deps_ok
 echo Continuing without installing; the app may fail to start.
 
 :deps_ok
+
+rem Prepare and verify OCR weights before opening the GUI.
+"%VENV_PY%" tools\prepare_models.py
+if errorlevel 1 goto :fail
 
 rem --- Model check (warn only) -----------------------------------------------
 if not exist "models\best.pt" (

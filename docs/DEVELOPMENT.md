@@ -272,8 +272,8 @@ No formal test framework is wired in; verification is done with the bundled
 helper scripts / one-liners:
 
 ```bash
-python -m py_compile *.py                       # syntax check all modules
-python calibrate.py                             # UI + round-trip to settings.json
+python -m compileall -q main.py cocbot tools    # syntax check all modules
+python tools/calibrate.py                             # UI + round-trip to settings.json
 
 # ADB smoke (read-only):
 python -c "from adb import EmulatorAdb; a=EmulatorAdb(); print(a.connect(), a.resolution(), a.screencap().shape)"

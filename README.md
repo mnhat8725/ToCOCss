@@ -1,16 +1,43 @@
 # COC Auto Farm Bot
 
+> **Note:** the `templates/` folder (UI template images and the ONNX models
+> `smart_farm`, `spell_target`, `deploy_zone`) is not included in this
+> repository. Place it locally at `templates/` before running the bot.
+
+## Vision and verification upgrade
+
+See [Vietnamese upgrade guide](progress/UPGRADE_GUIDE_VI.md) and
+[project progress](progress/PROGRESS.md) for the current behavior.
+The new default uses Smart Farm ONNX for full-resource buildings, template
+screen guards, and bounded goblin waves. Detection loss no longer estimates loot.
+
+Open the image inspector without an emulator:
+
+```powershell
+.venv\Scripts\python.exe main.py --vision-lab
+```
+
+Run all regression tests with persistent logs:
+
+```powershell
+.venv\Scripts\python.exe tools\verify_step.py regression
+```
+
+Each step retains a log and JSON result under `logs/verification/`. Per-session
+screen evidence is stored in `logs/sessions/`. Training requires reviewed labels;
+the dataset tooling rejects missing labels and cross-split duplicates.
+
 A **thread-safe** automation bot for Clash of Clans farming on LDPlayer. It screenshots the emulator through **ADB** (works while the window is minimized / in the background), taps fixed buttons from **calibrated coordinates** (no YOLO retraining after game updates), and uses YOLO + EasyOCR only for content that moves per base — layout, resource values, and post-battle loot.
 
 ## Features
 
 - **Background farming**: input + capture go through ADB, so the emulator window does not need focus or visibility
-- **Button calibration**: click the 11 fixed buttons once on a screenshot (`python calibrate.py`); positions are stored as normalized coordinates and scaled to any resolution
+- **Button calibration**: click the 11 fixed buttons once on a screenshot (`python tools/calibrate.py`); positions are stored as normalized coordinates and scaled to any resolution
 - **No retraining**: after a game update that moves buttons, just recalibrate (click the buttons again) instead of retraining YOLO
 - **YOLO + OCR for dynamic content**: base layout, Gold/Elixir/Dark Elixir values, post-battle loot are still detected per base
 - **Thread-safe GUI**: Tkinter interface communicates with the bot worker via a `queue` (no main-thread crashes)
 - **Graceful stop**: press **F12** to stop farming cleanly at any time
-- **Retry + self-recovery**: up to `max_retries` attempts per detection, and a failed resource scan taps calibrated retry spots and restarts the raid instead of killing the session (stops only after repeated failures, configurable)
+- **Verified recovery**: bounded scan retries; skip an opponent only after verifying the preview screen. Unknown states stop with diagnostic evidence.
 - **Fast start**: YOLO/OCR models load when you press Start, so the first raid has no cold-start stall
 - **Logging**: file + console logs to `logs/bot.log`; every tap is logged (button name, pixel + normalized coords), with per-sweep-tap detail in the file and per-row sweep summaries in the GUI log
 - **Error notifications (optional)**: push errors and completed sessions to your phone via [ntfy.sh](https://ntfy.sh), with an emulator screenshot attached
@@ -44,6 +71,18 @@ pip install -r requirements.txt
 
 Place your trained `best.pt` at `models/best.pt` (the default in `config.py`), or point `config.model_path` elsewhere.
 
+Prepare the two EasyOCR weights once while internet is available:
+
+```powershell
+.venv\Scripts\python.exe tools\1.py
+.venv\Scripts\python.exe main.py --selftest
+```
+
+Setup reuses valid files from `~/.EasyOCR/model`, verifies model checksums, and
+retries failed downloads. The bot loads OCR weights offline. `run.bat` runs the
+setup automatically before opening the GUI. See the HTTP 502/504 section in
+[Troubleshooting](docs/TROUBLESHOOTING.md) for manual setup.
+
 ## Usage
 
 ### 1. Calibrate the buttons (required once)
@@ -51,7 +90,7 @@ Place your trained `best.pt` at `models/best.pt` (the default in `config.py`), o
 Make sure LDPlayer is running and on your main village, then:
 
 ```bash
-python calibrate.py
+python tools/calibrate.py
 ```
 
 Click the 11 buttons in the order shown, then **Save**. This writes a `controls` section into `settings.json`. Use the **Recapture** button to grab a fresh screenshot whenever you navigate the game to another button's screen (no need to restart the tool). Recalibrate after a game update that moves buttons.
@@ -69,31 +108,37 @@ python main.py
 
 The GUI lets you set **thresholds** (minimum resources to attack), **goals** (total resources before stopping), Start/Stop, and a live log. **F12** stops the farm.
 
+A goal of **0 disables that resource goal**. The bot stops when all positive
+goals have been reached (including exact totals). With all goals at 0 it keeps
+running until stopped. Thresholds and goals must be non-negative whole numbers.
+
 ### Selecting the emulator
 
 There is no window picking. The emulator is identified purely by its **ADB port** — the default `127.0.0.1:5555` targets the first LDPlayer instance (mono/multi, single box). For another instance set `adb_port` in `config.py` (5557, 5559, ...). If the port can't connect at startup, the app shows an ADB error dialog and exits.
 
 ## Configuration
 
-`config.py` holds an `AppConfig` dataclass (YOLO model, `conf`, `gpu`, retries, and ADB host/port/path). End-user data lives in `settings.json` (`controls`). See [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+`cocbot/core/config.py` holds an `AppConfig` dataclass (YOLO model, `conf`, `gpu`, retries, and ADB host/port/path). End-user data lives in `settings.json` (`controls`). See [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
 ## Architecture
 
-| Module | Purpose |
-|--------|---------|
-| `main.py` | Entry point; wires all components together |
-| `config.py` | `AppConfig` dataclass (model, ADB, class labels) |
-| `adb.py` | `EmulatorAdb`: ADB discovery, connect, screencap, tap, resolution |
-| `calibrate.py` | Button calibration tool (click 11 buttons on a screenshot) |
-| `pinpoint.py` | Pixel/button → crosshair overlay on a live screenshot |
-| `window_manager.py` | `WindowManager`: ADB-only screen capture + guest-resolution offset handling |
-| `settings.py` | `settings.json` load/save |
-| `vision.py` | `VisionManager`: YOLO detection, EasyOCR reading (lazy model load) |
-| `automation.py` | `AutomationController`: ADB tap / keyevent wrapper |
-| `bot.py` | `CocBot`: farming brain; worker thread; checks `_stop_event` |
-| `gui.py` | `BotGUI`: Tkinter interface; drains the message queue |
-| `logger.py` | `setup_logging()`: file + console logging |
-| `notify.py` | `Notifier`: best-effort ntfy.sh push notifications (errors + completion) |
+```
+main.py                  Entry point (GUI bot, --selftest, --vision-lab)
+run.bat                  First-run setup + launch
+cocbot/
+  core/      paths.py (source/bundle/user paths), config.py (AppConfig), settings.py (settings.json),
+             logger.py, notify.py (ntfy.sh), diagnostics.py (SessionRecorder)
+  device/    adb.py (EmulatorAdb), automation.py (tap/keyevent), window_manager.py (capture)
+  vision/    manager.py (VisionManager: YOLO + EasyOCR), onnx_engine.py (ONNX decoder),
+             ocr_models.py (OCR weights), state_detection.py (screen templates + StateGuard)
+  game/      bot.py (CocBot farm loop), strategy.py (attack plans), execution.py (action runner)
+  ui/        gui.py (BotGUI), vision_lab.py (image inspector)
+tools/       calibrate.py, pinpoint.py, diagnose.py, prepare_models.py,
+             dataset/train/verify/replay utilities
+tests/       unittest suite (python -m unittest discover -s tests)
+templates/   UI templates + ONNX models     models/  YOLO best.pt
+progress/    roadmap, handoff and work logs
+```
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full picture.
 

@@ -18,6 +18,8 @@ import os
 import sys
 
 APP_DIR_NAME = "COCAutoFarm"
+# cocbot/core/paths.py -> project root (templates/, models/, settings.json live there)
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def is_frozen() -> bool:
@@ -29,11 +31,11 @@ def bundle_dir() -> str:
     """Directory holding the bundled read-only resources.
 
     In a PyInstaller bundle this is the temporary extraction folder; from
-    source it is the directory holding this file.
+    source it is the project root.
     """
     if is_frozen():
         return getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
-    return os.path.dirname(os.path.abspath(__file__))
+    return PROJECT_ROOT
 
 
 def user_data_dir() -> str:
@@ -47,7 +49,7 @@ def user_data_dir() -> str:
         base = os.environ.get("APPDATA") or os.path.expanduser("~")
         path = os.path.join(base, APP_DIR_NAME)
     else:
-        path = os.path.dirname(os.path.abspath(__file__))
+        path = PROJECT_ROOT
     os.makedirs(path, exist_ok=True)
     return path
 

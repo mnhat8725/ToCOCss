@@ -2,14 +2,19 @@
 Pixel pinpoint helper: shows where a guest-pixel coordinate (or a calibrated
 button) lands on the emulator screen.
 
-Runs standalone (`python pinpoint.py`), captures the current screen via ADB,
+Runs standalone (`python tools/pinpoint.py`), captures the current screen via ADB,
 overlays a crosshair + circle at the requested point, and pops a scaled Tk
 window with the pixel and normalized-fraction readout.
 
 Usage:
-    python pinpoint.py 986 603                  # guest-pixel coordinates
-    python pinpoint.py --button surr_conf       # a calibrated button's spot
+    python tools/pinpoint.py 986 603                  # guest-pixel coordinates
+    python tools/pinpoint.py --button surr_conf       # a calibrated button's spot
 """
+
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))  # project root
+
 import argparse
 import logging
 import sys
@@ -19,10 +24,10 @@ from tkinter import messagebox
 import cv2
 from PIL import Image, ImageTk
 
-from config import AppConfig
-from adb import EmulatorAdb
-from logger import setup_logging
-from settings import load_settings
+from cocbot.core.config import AppConfig
+from cocbot.device.adb import EmulatorAdb
+from cocbot.core.logger import setup_logging
+from cocbot.core.settings import load_settings
 
 logger = logging.getLogger(__name__)
 

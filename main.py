@@ -13,17 +13,19 @@ from tkinter import messagebox, ttk
 
 import keyboard
 
-from config import AppConfig
-from adb import EmulatorAdb
-from logger import setup_logging
-from window_manager import WindowManager
-from settings import load_settings
-from vision import VisionManager
-from automation import AutomationController
-from bot import CocBot
-from gui import BotGUI
-from notify import Notifier
-from utils import configure_runtime_env, resource_path
+from cocbot.core.config import AppConfig, apply_settings
+from cocbot.device.adb import EmulatorAdb
+from cocbot.core.logger import setup_logging
+from cocbot.device.window_manager import WindowManager
+from cocbot.core.settings import load_settings
+from cocbot.vision.manager import VisionManager
+from cocbot.device.automation import AutomationController
+from cocbot.game.bot import CocBot
+from cocbot.ui.gui import BotGUI
+from cocbot.core.notify import Notifier
+from cocbot.core.paths import configure_runtime_env, resource_path
+from cocbot.vision.state_detection import ScreenDetector
+from cocbot.core.diagnostics import SessionRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +52,7 @@ def _selftest():
         ("torchvision", "torchvision"),
         ("ultralytics", "ultralytics"),
         ("easyocr", "easyocr"),
+        ("onnxruntime", "onnxruntime"),
     ]
     failures = []
     for label, module in checks:
@@ -63,8 +66,8 @@ def _selftest():
 
     try:
         from ultralytics import YOLO
-        from config import AppConfig
-        from utils import resource_path
+        from cocbot.core.config import AppConfig
+        from cocbot.core.paths import resource_path
 
         model = resource_path(AppConfig().model_path)
         if not os.path.exists(model):
@@ -76,6 +79,22 @@ def _selftest():
     except Exception as e:
         failures.append(f"ultralytics/YOLO: {type(e).__name__}: {e}")
         print(f"  FAIL yolo model   {type(e).__name__}: {e}")
+
+    try:
+        from cocbot.vision.manager import VisionManager
+
+        config = AppConfig()
+        config.model_path = resource_path(config.model_path)
+        VisionManager(config).load()
+        print("  OK   OCR reader   weights verified and loaded offline")
+        import numpy as np
+        from cocbot.vision.onnx_engine import Engine
+        for name in ("smart_farm", "spell_target", "deploy_zone"):
+            result = Engine().infer(np.zeros((64, 64, 3), dtype=np.uint8), "selftest", name)
+            print(f"  OK   ONNX {name}: {result.output_shapes}")
+    except Exception as e:
+        failures.append(f"OCR reader: {type(e).__name__}: {e}")
+        print(f"  FAIL OCR reader   {type(e).__name__}: {e}")
 
     print()
     if failures:
@@ -121,7 +140,8 @@ def main():
     if os.path.exists(model_full_path):
         config.model_path = model_full_path
 
-    settings = load_settings()
+    settings = load_settings(strict=True)
+    apply_settings(config, settings)
     notifier = Notifier(settings.get("notifications"))
 
     # Root is kept hidden until the emulator is reachable; error dialogs
@@ -176,10 +196,13 @@ def main():
     attack = settings.get("attack") or {}
 
     msg_queue = queue.Queue()
-    bot = CocBot(config, window, vision, automation, msg_queue, controls=controls, waits=waits, notifier=notifier, recovery=recovery, attack=attack)
+    recorder = SessionRecorder()
+    detector = ScreenDetector(threshold=config.template_threshold) if config.state_guard_enabled else None
+    bot = CocBot(config, window, vision, automation, msg_queue, controls=controls, waits=waits,
+                 notifier=notifier, recovery=recovery, attack=attack, screen_detector=detector, recorder=recorder)
 
     splash.destroy()
-    app = BotGUI(root, bot, msg_queue)
+    app = BotGUI(root, bot, msg_queue, settings=settings)
     root.deiconify()
 
     # Emergency keyboard stop
@@ -192,6 +215,10 @@ def main():
 
 
 if __name__ == "__main__":
+    if "--vision-lab" in sys.argv:
+        from cocbot.ui.vision_lab import main as lab_main
+        lab_main()
+        sys.exit(0)
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
     try:

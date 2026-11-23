@@ -9,16 +9,25 @@ class BotGUI:
     Communicates with CocBot via a thread-safe queue.
     """
 
-    def __init__(self, root: tk.Tk, bot, msg_queue: queue.Queue):
+    def __init__(self, root: tk.Tk, bot, msg_queue: queue.Queue, settings=None):
         self.root = root
         self.bot = bot
         self.msg_queue = msg_queue
+        self.settings = settings if settings is not None else {}
 
         self.root.title("COC Auto Farm")
         self.root.geometry("500x520")
         self.root.minsize(450, 450)
 
         self._build_ui()
+        preferences = self.settings.get("farm", {})
+        for key, variables in (("targets", (self.min_gold, self.min_elixir, self.min_dark)),
+                               ("goals", (self.goal_gold, self.goal_elixir, self.goal_dark))):
+            values = preferences.get(key) if isinstance(preferences, dict) else None
+            if isinstance(values, list) and len(values) == 3 and all(type(v) is int and v >= 0 for v in values):
+                for var, value in zip(variables, values):
+                    var.set(str(value))
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._poll_queue()
 
     def _build_ui(self):
@@ -33,19 +42,19 @@ class BotGUI:
         )
 
         ttk.Label(mainframe, text="Min Gold").grid(column=1, row=1, sticky=tk.W)
-        self.min_gold = tk.IntVar(value=500000)
+        self.min_gold = tk.StringVar(value="500000")
         ttk.Entry(mainframe, width=10, textvariable=self.min_gold).grid(
             column=2, row=1, sticky=(tk.W, tk.E)
         )
 
         ttk.Label(mainframe, text="Min Elixir").grid(column=1, row=2, sticky=tk.W)
-        self.min_elixir = tk.IntVar(value=500000)
+        self.min_elixir = tk.StringVar(value="500000")
         ttk.Entry(mainframe, width=10, textvariable=self.min_elixir).grid(
             column=2, row=2, sticky=(tk.W, tk.E)
         )
 
         ttk.Label(mainframe, text="Min Dark Elixir").grid(column=1, row=3, sticky=tk.W)
-        self.min_dark = tk.IntVar(value=0)
+        self.min_dark = tk.StringVar(value="0")
         ttk.Entry(mainframe, width=10, textvariable=self.min_dark).grid(
             column=2, row=3, sticky=(tk.W, tk.E)
         )
@@ -56,19 +65,19 @@ class BotGUI:
         )
 
         ttk.Label(mainframe, text="Total Gold").grid(column=1, row=5, sticky=tk.W)
-        self.goal_gold = tk.IntVar(value=20000000)
+        self.goal_gold = tk.StringVar(value="20000000")
         ttk.Entry(mainframe, width=10, textvariable=self.goal_gold).grid(
             column=2, row=5, sticky=(tk.W, tk.E)
         )
 
         ttk.Label(mainframe, text="Total Elixir").grid(column=1, row=6, sticky=tk.W)
-        self.goal_elixir = tk.IntVar(value=20000000)
+        self.goal_elixir = tk.StringVar(value="20000000")
         ttk.Entry(mainframe, width=10, textvariable=self.goal_elixir).grid(
             column=2, row=6, sticky=(tk.W, tk.E)
         )
 
         ttk.Label(mainframe, text="Total Dark Elixir").grid(column=1, row=7, sticky=tk.W)
-        self.goal_dark = tk.IntVar(value=0)
+        self.goal_dark = tk.StringVar(value="0")
         ttk.Entry(mainframe, width=10, textvariable=self.goal_dark).grid(
             column=2, row=7, sticky=(tk.W, tk.E)
         )
@@ -83,6 +92,8 @@ class BotGUI:
         self.stop_btn = ttk.Button(ctrl_frame, text="Stop Farm (F12)", command=self._on_stop)
         self.stop_btn.pack(side=tk.LEFT)
         self.stop_btn.config(state="disabled")
+
+        ttk.Button(ctrl_frame, text="Kiểm tra ảnh", command=self._open_vision_lab).pack(side=tk.LEFT, padx=8)
 
         # --- Status ---
         self.status_var = tk.StringVar(value="Idle")
@@ -116,20 +127,35 @@ class BotGUI:
         log_frame.rowconfigure(0, weight=1)
 
     def _on_start(self):
-        targets = (
-            self.min_gold.get(),
-            self.min_elixir.get(),
-            self.min_dark.get(),
-        )
-        goals = (
-            self.goal_gold.get(),
-            self.goal_elixir.get(),
-            self.goal_dark.get(),
-        )
+        try:
+            targets = tuple(int(var.get()) for var in (self.min_gold, self.min_elixir, self.min_dark))
+            goals = tuple(int(var.get()) for var in (self.goal_gold, self.goal_elixir, self.goal_dark))
+            if any(value < 0 for value in targets + goals):
+                raise ValueError("negative value")
+        except (tk.TclError, ValueError):
+            messagebox.showerror("Invalid input", "Enter non-negative whole numbers for thresholds and goals.")
+            return
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
         self.status_var.set("starting...")
-        self.bot.start(targets, goals)
+        if hasattr(self, "settings"):
+            from cocbot.core.settings import save_settings
+            self.settings["schema_version"] = 1
+            self.settings["farm"] = {"targets": list(targets), "goals": list(goals)}
+            if not save_settings(self.settings):
+                self._log("Could not save farm preferences; see log for details.")
+        if not self.bot.start(targets, goals):
+            self.start_btn.config(state="normal")
+            self.stop_btn.config(state="disabled")
+            self.status_var.set("Start rejected - check log")
+
+    def _on_close(self):
+        self.bot.stop()
+        self.root.destroy()
+
+    def _open_vision_lab(self):
+        from cocbot.ui.vision_lab import VisionLab
+        VisionLab(tk.Toplevel(self.root), capture=self.bot.window.capture_window)
 
     def _on_stop(self):
         self.stop_btn.config(state="disabled")

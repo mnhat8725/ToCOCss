@@ -150,7 +150,7 @@ class EmulatorAdb:
 
     def _is_device(self, serial):
         p = self._run(["devices"], timeout=8)
-        if p.returncode != 0:
+        if p is None or p.returncode != 0:
             return False
         for line in p.stdout.decode("utf-8", "ignore").splitlines():
             parts = line.split()
@@ -181,6 +181,9 @@ class EmulatorAdb:
         except subprocess.TimeoutExpired:
             self.last_error = f"adb command timed out: {' '.join(args)}"
             return None
+        except OSError as exc:
+            self.last_error = f"could not run adb: {exc}"
+            return None
 
     def _refresh_resolution(self):
         p = self._run(["shell", "wm", "size"], timeout=10)
@@ -193,7 +196,6 @@ class EmulatorAdb:
                     self._res = (w, h)
                 except ValueError:
                     pass
-                return
 
     def resolution(self):
         """Return guest resolution as (width, height)."""
@@ -207,7 +209,9 @@ class EmulatorAdb:
             return None
         p = self._run(["exec-out", "screencap", "-p"], timeout=30)
         if p is None or p.returncode != 0 or not p.stdout:
-            self.last_error = "screencap failed"
+            if p is not None:
+                detail = p.stderr.decode("utf-8", "replace").strip()
+                self.last_error = f"screencap failed (exit {p.returncode}, device {self.serial}): {detail or 'empty output'}"
             return None
         frame = cv2.imdecode(np.frombuffer(p.stdout, np.uint8), cv2.IMREAD_COLOR)
         if frame is None:

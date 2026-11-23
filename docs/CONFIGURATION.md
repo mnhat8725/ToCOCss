@@ -1,5 +1,9 @@
 # Configuration
 
+For the new `vision`, `farm`, `schema_version` and bounded `attack` fields, see
+[the upgrade guide](../progress/UPGRADE_GUIDE_VI.md). `attack.drain_ratio` is retired; use
+`max_waves` and `time_limit`. Screen guards are enabled by default.
+
 There are two configuration layers:
 
 - **`config.py`** — code-level `AppConfig` dataclass (model, ADB, class labels).
@@ -114,13 +118,11 @@ ntfy.sh's 2 MB attachment limit).
 
 ### `recovery`
 
-Controls how the bot recovers when a scan cannot find the gold/elixir labels it
-needs (usually a screen that was still loading). Instead of ending the session,
-it backs out and starts the raid loop over. On the **first** consecutive
-*resource*-scan failure it taps `surr` (the values are often hidden behind a
-dialog or a lingering battle); after that, and for base-layout failures, it taps
-the calibrated retry spots (`retry_btn_1`, `retry_btn_2`, then `retry_btn_3`, one
-tap each — set them in `calibrate.py`).
+With screen guards enabled, a failed resource/layout scan may skip to the
+next opponent only after verifying the preview screen. Unknown states stop
+with an image and JSON evidence. The retry limit is checked before recovery
+input. The older coordinate-only recovery applies only when the screen guard
+is explicitly disabled in code.
 
 ```json
 "recovery": {
@@ -130,7 +132,7 @@ tap each — set them in `calibrate.py`).
 
 | Key | Default | Purpose |
 | --- | --- | --- |
-| `scan_restart_limit` | `3` | How many scans may fail **in a row** before the bot gives up (the first failure is the `surr` tap, the rest use the retry spots). The count resets to 0 as soon as any scan succeeds, so intermittent misses keep the session alive. |
+| `scan_restart_limit` | `3` | How many scans may fail **in a row** before the bot gives up (guarded recovery skips only a verified opponent preview). The count resets to 0 as soon as any scan succeeds, so intermittent misses keep the session alive. |
 
 The same limit also drives the **0-loot watchdog**: if that many raids in a row
 collect 0 Gold, 0 Elixir and 0 Dark (usually a missed surrender leading to an

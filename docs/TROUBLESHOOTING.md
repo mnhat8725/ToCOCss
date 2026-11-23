@@ -1,5 +1,43 @@
 # Troubleshooting
 
+## HTTP 502/504 while loading EasyOCR
+
+This error occurs while downloading the OCR weights from GitHub. Installing
+Python dependencies does not install these weights. Prepare them separately:
+
+```powershell
+.venv\Scripts\python.exe tools\1.py
+.venv\Scripts\python.exe tools\1.py --check
+.venv\Scripts\python.exe main.py --selftest
+```
+
+The setup retries downloads up to three times with a 30-second socket timeout,
+checks each weight against EasyOCR's checksum, and reuses valid cached files.
+The self-test actually loads the OCR reader offline as well as the YOLO model.
+The farm session never downloads OCR weights; missing or corrupt files produce
+an actionable setup error before any farming taps.
+
+If GitHub is still unavailable, download these official archives using a
+browser or another network:
+
+- [Detection model: craft_mlt_25k.zip](https://github.com/JaidedAI/EasyOCR/releases/download/pre-v1.1.6/craft_mlt_25k.zip)
+- [English recognition model: english_g2.zip](https://github.com/JaidedAI/EasyOCR/releases/download/v1.3/english_g2.zip)
+
+Extract `craft_mlt_25k.pth` and `english_g2.pth` into `easyocr_data/model/` next
+to the source files, then run the checks above. If `EASYOCR_MODULE_PATH` or
+`MODULE_PATH` is set, its `model/` subdirectory takes precedence. A frozen build
+uses bundled weights when present, otherwise `%APPDATA%/COCAutoFarm/easyocr_data/model/`.
+
+## Checks for developers
+
+```powershell
+.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+These regression tests cover model setup (including a simulated HTTP 502 and
+corrupt downloads), stop behavior, goal completion, and ADB failures. They do
+not connect to the emulator or deploy troops.
+
 ## "Could not connect to the emulator via ADB"
 
 Check, in order:
@@ -17,12 +55,12 @@ Check, in order:
 5. `adb devices` shows the serial as **`device`** (not `offline`). If `offline`,
    restart the adb server: `adb kill-server` then connect again.
 
-## "Run calibrate.py first" when pressing Start
+## "Run tools/calibrate.py first" when pressing Start
 
 `settings.json` has no `controls` entry for one of the 11 buttons. Fix:
 
 ```
-python calibrate.py
+python tools/calibrate.py
 ```
 
 Set all 11 buttons, Save, relaunch `main.py`.

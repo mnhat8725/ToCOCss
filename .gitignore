@@ -20,6 +20,8 @@ __pycache__/
 
 # EasyOCR weights bundled into the build (large, re-downloadable)
 assets/easyocr_data/model/*.pth
+easyocr_data/
+models/english_g2.zip
 
 # Build and packaging (EXE artifacts)
 build/
@@ -33,6 +35,8 @@ build.bat
 
 # Logs
 logs/
+runs/
+datasets/
 *.log
 
 # Local user settings (selected emulator window)
@@ -60,3 +64,6 @@ Thumbs.db
 archive/
 backup/
 *.bak
+
+# Third-party UI templates and ONNX models (AutoCOCVN) - kept local only, not redistributed
+templates/

@@ -14,7 +14,7 @@
 This is the only per-install / per-game-update setup:
 
 ```
-python calibrate.py
+python tools/calibrate.py
 ```
 
 1. The tool connects via ADB and shows a screenshot of your current screen.
@@ -47,7 +47,7 @@ and `Clear selected` unsets only the currently selected button.
 > Note: if you calibrated with an older version of this project, your
 > `settings.json` will be missing buttons that were once YOLO-detected
 > (`nxt_btn`, `s_goblin`, `surr`). The bot refuses to farm
-> ("Run calibrate.py first") until you calibrate once more with the current
+> ("Run tools/calibrate.py first") until you calibrate once more with the current
 > version.
 
 > Tip: calibrate while on the exact screens the bot will click, i.e. have the
@@ -93,83 +93,37 @@ also minimize it yourself; input and capture use ADB, not the desktop, so the
 bot keeps running either way. The status line shows
 `running - press F12 or Stop Farm` while active.
 
-## What the bot does
+## What the upgraded bot does
 
-- Opens the attack flow (Attack button → Find Match → Attack).
-- Loads its YOLO/OCR models up front when you press **Start** (the status shows
-  `loading` first, so the first raid is not slowed down).
-- Scans each base's visible resources; attacks (goblins) when your thresholds
-  are met, otherwise clicks **Next**.
-- Attacks in **waves**: each wave sweeps every gold/elixir/dark store row, then
-  re-scans the base and compares the number of resource providers left with the
-  number seen at scan time. It keeps deploying waves until at least
-  `attack.drain_ratio` (default **80%**) of the providers are gone, or
-  `attack.time_limit` seconds (default **90**, i.e. 1.5 min, counted from the
-  first sweep) have passed — whichever comes first. Only then does it surrender
-  and read the loot.
-- If a scan can't read the gold/elixir labels (usually a screen still loading),
-  backs out and restarts the raid loop instead of ending the session. The first
-  consecutive *resource*-scan failure taps `surr` (the values are often hidden
-  behind a dialog/battle); after that it taps the calibrated retry spots
-  (`retry_btn_1`, `retry_btn_2`, `retry_btn_3`). Each failure also pushes a
-  notification with a screenshot of the failing screen. It only stops after
-  `recovery.scan_restart_limit` failures **in a row** (default 3), resetting the
-  count on any successful scan.
-- Reads the post-battle loot into the running totals, then returns home. If
-  `recovery.scan_restart_limit` raids in a row all collect 0 loot (usually a
-  missed surrender), it notifies and stops so a desync can't run silently.
-- Stops when goals are met, F12 is pressed, or an error is reported.
+See [the current upgrade guide](../progress/UPGRADE_GUIDE_VI.md) for all new controls.
+
+- Loads YOLO, OCR and Smart Farm before navigation.
+- Verifies home/menu/preview/battle/results with template evidence across frames.
+- Uses Smart Farm for full-resource buildings and the existing detector + OCR for numbers.
+- Requires stable readable threshold resources before attacking.
+- Executes the existing goblin row strategy through validated, cancellable actions.
+- Limits deployment by `attack.max_waves` (3) and `attack.time_limit` (30 seconds).
+- Reads post-battle loot using two agreeing observations rather than the maximum OCR value.
+- Stops on unknown screen states and records screenshots and structured events.
+
+Detection loss does not measure destruction or loot. `attack.drain_ratio` is
+no longer used. Stop is checked between individual taps, not only between waves.
 
 ## Tuning timings
 
-Every wait is configurable in `settings.json` under `waits` (seconds) — you only
-list the ones you want to change; the rest keep their defaults. Useful when your
-emulator is slow and a step fires before the screen is ready:
+`settings.json` accepts `waits`, `attack` and `vision` settings. Example:
 
 ```json
-{ "waits": { "surr_conf": 1.0, "return_home": 1.5, "attack_settle": 6.0 } }
+{
+  "waits": {"surr_conf": 1.0, "return_home": 1.5},
+  "attack": {"time_limit": 30, "max_waves": 3},
+  "vision": {"state_timeout": 12, "template_threshold": 0.85}
+}
 ```
 
-Each deploy wave always sweeps every provider row once it starts, then pauses
-`attack_wave_settle` (default 5.0) before re-scanning, so if your troops need
-longer to damage the stores raise `attack_wave_settle`; `attack_settle` (default
-5.0) is the final pause before surrendering. A mid-attack Stop is honored before
-the first deploy and between waves, never mid-sweep.
-
-The wave loop itself is tuned under `attack` (not `waits`):
-
-```json
-{ "attack": { "drain_ratio": 0.8, "time_limit": 90 } }
-```
-
-`drain_ratio` is the fraction of providers that must be gone before it stops
-attacking (0.8 = 80%); `time_limit` is the hard cap in seconds (there is no wave
-cap, so the clock is the guaranteed stop).
-
-The post-battle loot read is **data-driven**: instead of a fixed pause it
-re-reads the screen every `scan_post_interval` (default 0.3s) and keeps the
-highest value seen per resource, ignoring boxes the model tags twice for the same
-row. It stops as soon as Gold, Elixir **and** Dark are all non-zero — or earlier
-once the summary's **Return Home** button is on screen and at least one value is
-real (a resource genuinely at 0 shouldn't force the full wait). An early,
-still-animating frame can read 0, so keep the interval short; it gives up after
-`scan_post_timeout` (12.0)s, keeping whatever it could read (a raid that read
-nothing at all counts as 0 with a warning).
-
-Each raid logs what it counted and the running total, e.g.
-`loot this raid: Gold +128400 | Elixir +92000 | Dark +320 (totals Gold 1284000 | ...)`.
-The raw OCR text behind each number is written to `logs/bot.log` at DEBUG level,
-so if a total ever looks wrong you can compare the logged values against the
-in-game loot screen.
-
-Each wave logs the provider count (`providers at scan: 15 (gold 9 / elixir 5 /
-dark 1)`), and just before it surrenders the bot takes a final reading:
-`drain at surrender: providers 3/15 remaining (80% drained)`. At the end of the
-session — goals met, an error, **or** a manual stop — it logs every raid's
-result, e.g. `drain per raid: 73%, 91%, 80% | average 81% over 3 raid(s)`. The
-average is also included in the completion notification. If a raid errors out it
-is **not** counted: error notifications report the average of the **previous
-fully-completed** raids, so you still get a picture of the session so far.
+Post-battle polling uses `scan_post_interval` (0.3 seconds) and
+`scan_post_timeout` (12 seconds). A real zero can be confirmed; an unreadable
+resource is not a confirmed zero. At timeout only confirmed values are counted.
 
 Each tap line in the log shows the wait that followed it, e.g.
 `tap surr_conf at (987, 603) [0.617, 0.670] wait 1.0s`. The full per-step
@@ -205,9 +159,9 @@ written to `logs/bot.log`. See `docs/CONFIGURATION.md` for the full key list.
 ## Useful commands
 
 ```bash
-python calibrate.py         # (re)calibrate the 11 buttons
-python pinpoint.py 986 603          # crosshair over guest-pixel (986, 603)
-python pinpoint.py --button surr_conf   # crosshair over a calibrated button's spot
+python tools/calibrate.py         # (re)calibrate the 11 buttons
+python tools/pinpoint.py 986 603          # crosshair over guest-pixel (986, 603)
+python tools/pinpoint.py --button surr_conf   # crosshair over a calibrated button's spot
 python main.py              # run the GUI bot
 adb connect 127.0.0.1:5555  # verify the first LDPlayer instance is reachable
 adb -s 127.0.0.1:5555 shell wm size   # print guest resolution

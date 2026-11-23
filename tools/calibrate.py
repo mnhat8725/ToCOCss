@@ -1,7 +1,7 @@
 """
 Button calibration tool.
 
-Runs standalone (`python calibrate.py`) and works on the CURRENT game state:
+Runs standalone (`python tools/calibrate.py`) and works on the CURRENT game state:
 captures the emulator screen via ADB, shows it scaled, and lets you click each
 of the 11 fixed buttons. Positions are stored in settings.json as normalized
 coordinates (fractions of the screen), so they survive resolution changes and
@@ -20,6 +20,10 @@ To re-fix just ONE button (e.g. an update moved a single spot), click its row in
 the progress list, (optionally Recapture to change screens), click the new spot on
 the screenshot, then press Save — the other buttons keep their saved coordinates.
 """
+
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))  # project root
 
 # The eleven calibrated controls, in farm-loop press order, with plain-English
 # descriptions shown in the UI. Everything positionally fixed lives here;
@@ -61,9 +65,9 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
-from config import AppConfig
-from adb import EmulatorAdb
-from settings import load_settings, save_settings
+from cocbot.core.config import AppConfig
+from cocbot.device.adb import EmulatorAdb
+from cocbot.core.settings import load_settings, save_settings
 
 
 class Calibrator:

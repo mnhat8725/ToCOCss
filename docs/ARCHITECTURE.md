@@ -12,6 +12,30 @@ normalized coordinates** (fractions of the guest screen, stored in
 the storehouses to pick from and the text resource values (Gold / Elixir /
 Dark Elixir, and post-battle loot).
 
+## Project layout
+
+```
+main.py                  Entry point (GUI bot, --selftest, --vision-lab)
+run.bat                  First-run setup + launch
+cocbot/
+  core/      paths.py (source/bundle/user paths), config.py (AppConfig), settings.py (settings.json),
+             logger.py, notify.py (ntfy.sh), diagnostics.py (SessionRecorder)
+  device/    adb.py (EmulatorAdb), automation.py (tap/keyevent), window_manager.py (capture)
+  vision/    manager.py (VisionManager: YOLO + EasyOCR), onnx_engine.py (ONNX decoder),
+             ocr_models.py (OCR weights), state_detection.py (screen templates + StateGuard)
+  game/      bot.py (CocBot farm loop), strategy.py (attack plans), execution.py (action runner)
+  ui/        gui.py (BotGUI), vision_lab.py (image inspector)
+tools/       calibrate.py, pinpoint.py, diagnose.py, prepare_models.py,
+             dataset/train/verify/replay utilities
+tests/       unittest suite (python -m unittest discover -s tests)
+templates/   UI templates + ONNX models     models/  YOLO best.pt
+progress/    roadmap, handoff and work logs
+```
+
+Module names below refer to the files inside `cocbot/` (e.g. `bot.py` is
+`cocbot/game/bot.py`, `vision.py` is `cocbot/vision/manager.py`, `utils` is
+`cocbot/core/paths.py`); tools live in `tools/`.
+
 ## Module dependency diagram
 
 ```
